@@ -65,9 +65,26 @@ CHAT_DECISION_SYSTEM = """你是課程助教系統的對話路由器。請根據
 
 請只輸出 JSON，不要加任何其他文字。"""
 
+QUIZ_REQUEST_SYSTEM = """你是課程助教系統的出題需求分析器。請判斷學生是否已明確提供出題所需資訊。
+
+請只輸出 JSON，不要加任何其他文字，格式如下：
+{
+  "needs_clarification": false,
+  "multiple_choice_count": 3,
+  "short_answer_count": 0,
+  "reason": "學生明確要求生成 3 個選擇題"
+}
+
+判斷規則：
+1. 若學生明確說出題型與題數，例如「3 個選擇題」、「選擇題三題」、「兩題問答題」，needs_clarification 必須是 false。
+2. 題型包含選擇題、單選題、multiple choice、問答題、簡答題、short answer。
+3. 若學生只說「出題」、「生成題目」、「出幾題練習」但沒有明確題型或題數，needs_clarification 必須是 true。
+4. 未要求的題型數量填 0。
+5. 題數必須是非負整數，不可自行猜測。"""
+
 CHAT_ANSWER_SYSTEM = """你是一位課程助教。請根據課程摘要與對話脈絡，用繁體中文回答學生問題。
 規則：
-1. 優先根據課程摘要回答，不要捏造摘要沒有的細節。
+1. 優先根據檢索到的教材片段與課程摘要回答，不要捏造教材沒有的細節。
 2. 若摘要不足以回答，請明確說明目前教材資訊不足，並指出可補充哪些資料。
 3. 回答要清楚、具教學感，可以使用條列式。"""
 
@@ -105,35 +122,46 @@ def parse_count(raw: str) -> int | None:
 
 def parse_quiz_request(message: str, default_multiple_choice_count: int) -> dict:
     number = r"(\d+|[一二兩三四五六七八九十]{1,3})"
+    unit = r"(?:題|道|個|則|份)?"
+    multiple_choice_terms = r"(?:選擇題|單選題|選擇|choice|multiple\s*choice)"
+    short_answer_terms = r"(?:問答題|簡答題|申論題|short\s*answer)"
     multiple_choice_count = default_multiple_choice_count
     short_answer_count = 3
-    asked_multiple_choice = bool(re.search(r"(選擇題|單選題|choice|multiple\s*choice)", message, re.IGNORECASE))
-    asked_short_answer = bool(re.search(r"(問答題|簡答題|申論題|short\s*answer)", message, re.IGNORECASE))
+    asked_multiple_choice = bool(re.search(multiple_choice_terms, message, re.IGNORECASE))
+    asked_short_answer = bool(re.search(short_answer_terms, message, re.IGNORECASE))
     has_count = False
 
     mc_match = re.search(
-        rf"{number}\s*(?:題|道)?\s*(?:選擇題|單選題|choice|multiple\s*choice)",
+        rf"{number}\s*{unit}\s*{multiple_choice_terms}",
+        message,
+        re.IGNORECASE,
+    ) or re.search(
+        rf"{multiple_choice_terms}\s*{number}\s*{unit}",
         message,
         re.IGNORECASE,
     )
     if mc_match:
-        parsed = parse_count(mc_match.group(1))
+        parsed = parse_count(next(group for group in mc_match.groups() if group))
         if parsed is not None:
             multiple_choice_count = parsed
             has_count = True
 
     sa_match = re.search(
-        rf"{number}\s*(?:題|道)?\s*(?:問答題|簡答題|申論題|short\s*answer)",
+        rf"{number}\s*{unit}\s*{short_answer_terms}",
+        message,
+        re.IGNORECASE,
+    ) or re.search(
+        rf"{short_answer_terms}\s*{number}\s*{unit}",
         message,
         re.IGNORECASE,
     )
     if sa_match:
-        parsed = parse_count(sa_match.group(1))
+        parsed = parse_count(next(group for group in sa_match.groups() if group))
         if parsed is not None:
             short_answer_count = parsed
             has_count = True
 
-    generic_match = re.search(rf"(?:出|產生|生成|設計|給我|幫我出)\s*{number}\s*(?:題|道)", message)
+    generic_match = re.search(rf"(?:出|產生|生成|設計|給我|幫我出)\s*{number}\s*{unit}", message)
     if generic_match and not mc_match and not sa_match:
         parsed = parse_count(generic_match.group(1))
         if parsed is not None:
@@ -216,6 +244,49 @@ def validate_quiz_counts(
     return True, ""
 
 
+def chunk_material_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[dict]:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return []
+
+    chunks = []
+    start = 0
+    while start < len(cleaned):
+        end = min(start + chunk_size, len(cleaned))
+        chunks.append({"id": len(chunks) + 1, "text": cleaned[start:end]})
+        if end == len(cleaned):
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def tokenize_for_retrieval(text: str) -> set[str]:
+    tokens = re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]", text.lower())
+    return {token for token in tokens if token.strip()}
+
+
+def retrieve_relevant_chunks(query: str, chunks: list[dict], top_k: int = 4) -> list[dict]:
+    query_tokens = tokenize_for_retrieval(query)
+    if not query_tokens or not chunks:
+        return []
+
+    scored_chunks = []
+    for chunk in chunks:
+        chunk_tokens = tokenize_for_retrieval(chunk["text"])
+        overlap = query_tokens & chunk_tokens
+        if overlap:
+            scored_chunks.append((len(overlap), chunk))
+
+    scored_chunks.sort(key=lambda item: item[0], reverse=True)
+    return [chunk for _, chunk in scored_chunks[:top_k]]
+
+
+def format_retrieved_context(chunks: list[dict]) -> str:
+    if not chunks:
+        return ""
+    return "\n\n".join(f"【教材片段 {chunk['id']}】\n{chunk['text']}" for chunk in chunks)
+
+
 class SummaryAgent:
     """Agent A：負責將教材內容轉換為結構化摘要。"""
 
@@ -252,10 +323,16 @@ class QuizAgent:
         self.difficulty = difficulty
         self.model = model
 
-    def run(self, summary: str, feedback: str | None = None) -> str:
+    def run(
+        self,
+        summary: str,
+        feedback: str | None = None,
+        source_context: str = "",
+    ) -> str:
         system = QUIZ_SYSTEM_TMPL.format(difficulty=self.difficulty)
         prompt = (
             f"課程摘要如下：\n\n{summary}\n\n"
+            f"相關教材片段如下：\n\n{source_context or '（沒有額外檢索片段，請依課程摘要出題。）'}\n\n"
             f"請設計 {self.multiple_choice_count} 道選擇題和 {self.short_answer_count} 道問答題。"
             "\n若某一類題目數量為 0，該 JSON 欄位必須輸出空陣列 []，不要額外生成該類題目。"
         )
@@ -280,8 +357,12 @@ class ReviewAgent:
         self.client = client
         self.model = model
 
-    def run(self, summary: str, quiz_raw: str) -> dict:
-        prompt = f"【課程摘要】\n{summary}\n\n---\n\n【待審查的測驗題目（JSON）】\n{quiz_raw}"
+    def run(self, summary: str, quiz_raw: str, source_context: str = "") -> dict:
+        prompt = (
+            f"【課程摘要】\n{summary}\n\n"
+            f"---\n\n【相關教材片段】\n{source_context or '（無）'}\n\n"
+            f"---\n\n【待審查的測驗題目（JSON）】\n{quiz_raw}"
+        )
         response = self.client.models.generate_content(
             model=self.model,
             contents=prompt,
@@ -344,7 +425,51 @@ class AgentCore:
 
         return {"action": "ANSWER", "reason": "無法解析判斷結果，改以一般助教回答處理。"}
 
-    def answer_chat(self, summary: str, chat_history: list[dict], latest_message: str) -> str:
+    def extract_quiz_request(self, latest_message: str) -> dict:
+        fallback = parse_quiz_request(latest_message, self.num_questions)
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=f"【學生最新訊息】\n{latest_message}",
+            config=types.GenerateContentConfig(
+                system_instruction=QUIZ_REQUEST_SYSTEM,
+                temperature=0,
+            ),
+        )
+        match = re.search(r"\{[\s\S]*\}", response.text.strip())
+        if not match:
+            return fallback
+
+        try:
+            parsed = json.loads(match.group())
+        except json.JSONDecodeError:
+            return fallback
+
+        if not isinstance(parsed.get("needs_clarification"), bool):
+            return fallback
+
+        multiple_choice_count = parsed.get("multiple_choice_count", 0)
+        short_answer_count = parsed.get("short_answer_count", 0)
+        if not isinstance(multiple_choice_count, int) or not isinstance(short_answer_count, int):
+            return fallback
+        if multiple_choice_count < 0 or short_answer_count < 0:
+            return fallback
+
+        return {
+            "multiple_choice_count": multiple_choice_count,
+            "short_answer_count": short_answer_count,
+            "has_type": not parsed["needs_clarification"],
+            "has_count": not parsed["needs_clarification"],
+            "needs_clarification": parsed["needs_clarification"],
+            "reason": parsed.get("reason", ""),
+        }
+
+    def answer_chat(
+        self,
+        summary: str,
+        chat_history: list[dict],
+        latest_message: str,
+        source_context: str = "",
+    ) -> str:
         recent_history = chat_history[-8:]
         history_text = "\n".join(
             f"{'學生' if item['role'] == 'user' else '助教'}：{item['content']}"
@@ -352,6 +477,7 @@ class AgentCore:
         )
         prompt = (
             f"【課程摘要】\n{summary}\n\n"
+            f"【檢索到的教材片段】\n{source_context or '（無）'}\n\n"
             f"【近期對話】\n{history_text}\n\n"
             f"【請回答學生最新問題】\n{latest_message}"
         )
@@ -371,6 +497,7 @@ class AgentCore:
         on_status,
         multiple_choice_count: int | None = None,
         short_answer_count: int = 3,
+        source_context: str = "",
     ) -> tuple[str, list[dict]]:
         quiz_agent = QuizAgent(
             self.client,
@@ -392,7 +519,7 @@ class AgentCore:
         for attempt in range(MAX_RETRIES):
             round_label = "初次出題" if attempt == 0 else f"第 {attempt + 1} 次修訂"
             on_status(f"📝 **Agent B（測驗出題）**：{round_label}中...")
-            quiz_raw = quiz_agent.run(summary, feedback)
+            quiz_raw = quiz_agent.run(summary, feedback, source_context=source_context)
             quiz_raw = normalize_quiz_raw(
                 quiz_raw,
                 expected_multiple_choice_count,
@@ -420,7 +547,7 @@ class AgentCore:
                 continue
 
             on_status("🔎 **ReviewAgent（品質審查）**：正在審查題目品質...")
-            review = review_agent.run(summary, quiz_raw)
+            review = review_agent.run(summary, quiz_raw, source_context=source_context)
             review_log.append(
                 {
                     "attempt": attempt + 1,
@@ -613,21 +740,19 @@ def render_quiz_config_form(default_request: dict, form_key: str) -> dict | None
         st.markdown("請補充要生成的題型與題數：")
         include_mc = st.checkbox("選擇題", value=default_has_mc)
         mc_count = st.number_input(
-            "選擇題題數",
+            "選擇題題數（未勾選選擇題則忽略）",
             min_value=1,
             max_value=20,
             value=default_mc_count,
             step=1,
-            disabled=not include_mc,
         )
         include_sa = st.checkbox("問答題", value=default_has_sa)
         sa_count = st.number_input(
-            "問答題題數",
+            "問答題題數（未勾選問答題則忽略）",
             min_value=1,
             max_value=20,
             value=default_sa_count,
             step=1,
-            disabled=not include_sa,
         )
         submitted = st.form_submit_button("開始生成題目", type="primary")
 
@@ -643,19 +768,27 @@ def render_quiz_config_form(default_request: dict, form_key: str) -> dict | None
     }
 
 
-def run_quiz_generation(core: AgentCore, summary: str, quiz_request: dict) -> dict:
+def run_quiz_generation(
+    core: AgentCore,
+    summary: str,
+    quiz_request: dict,
+    source_context: str = "",
+) -> dict:
     with st.status("📝 QuizAgent 出題與審查中...", expanded=True) as status_widget:
         st.write(
             "📌 採用出題設定："
             f"{quiz_request['multiple_choice_count']} 題選擇題、"
             f"{quiz_request['short_answer_count']} 題問答題。"
         )
+        if source_context:
+            st.write("📚 已檢索相關教材片段並納入出題依據。")
         try:
             quiz_raw, review_log = core.generate_quiz(
                 summary,
                 on_status=lambda m: st.write(m),
                 multiple_choice_count=quiz_request["multiple_choice_count"],
                 short_answer_count=quiz_request["short_answer_count"],
+                source_context=source_context,
             )
             status_widget.update(label="✅ 題目生成完成！", state="complete")
         except Exception:
@@ -673,22 +806,29 @@ def run_quiz_generation(core: AgentCore, summary: str, quiz_request: dict) -> di
     }
 
 
+def get_rag_context(query: str) -> str:
+    chunks = st.session_state.get("material_chunks", [])
+    retrieved_chunks = retrieve_relevant_chunks(query, chunks)
+    return format_retrieved_context(retrieved_chunks)
+
+
 # ── Streamlit 介面 ────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="課程助教系統", page_icon="🎓", layout="wide")
 
 AVAILABLE_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
     "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
 ]
 
 with st.sidebar:
     st.header("⚙️ 設定")
     api_key = st.text_input("Gemini API Key", type="password", placeholder="AIza...")
     st.divider()
-    model = st.selectbox("Gemini 模型", AVAILABLE_MODELS, index=0)
+    model = st.selectbox("Gemini 模型（依額度排序）", AVAILABLE_MODELS, index=0)
     difficulty = st.selectbox("題目難度", ["簡單", "中等", "困難"], index=1)
     st.divider()
     st.caption("支援 PDF、.md、.txt 上傳，或直接貼入文字。")
@@ -699,9 +839,7 @@ st.markdown(
     "系統會由 Agent Core 判斷是否交給 Agent B 生成測驗題目並進行審查。"
 )
 
-tab_input, tab_chat = st.tabs(["📂 輸入教材", "💬 聊天助教"])
-
-with tab_input:
+with st.container():
     st.subheader("教材來源")
     col_upload, col_text = st.columns([1, 1], gap="large")
     with col_upload:
@@ -733,15 +871,18 @@ with tab_input:
                 with st.spinner("正在上傳 PDF 至 Gemini Files API..."):
                     try:
                         material = upload_pdf_to_gemini(client, uploaded_file)
+                        material_text = ""
                     except Exception as e:
                         st.error(f"PDF 上傳失敗：{e}")
                         st.stop()
             else:
-                material = uploaded_file.read().decode("utf-8")
+                material_text = uploaded_file.read().decode("utf-8")
+                material = material_text
         else:
-            material = text_input.strip()
+            material_text = text_input.strip()
+            material = material_text
 
-        with st.status("🤖 多 Agent 協作執行中...", expanded=True) as status_widget:
+        with st.status("🤖 Thinking... Agent A 正在閱讀教材並生成摘要", expanded=True) as status_widget:
             try:
                 summary = core.generate_summary(material, on_status=lambda m: st.write(m))
                 status_widget.update(label="✅ 分析完成！", state="complete")
@@ -751,9 +892,11 @@ with tab_input:
                 st.stop()
 
         st.session_state["summary"] = summary
+        st.session_state["material_chunks"] = chunk_material_text(material_text)
         st.session_state.pop("quiz_raw", None)
         st.session_state.pop("review_log", None)
         st.session_state.pop("pending_quiz_request", None)
+        st.session_state.pop("pending_quiz_query", None)
         st.session_state["chat_messages"] = [
             {
                 "role": "assistant",
@@ -762,16 +905,23 @@ with tab_input:
                 "summary": summary,
             }
         ]
-        st.success("分析完成！請切換到「💬 聊天助教」標籤查看摘要並開始互動。")
+        st.success("分析完成！請往下查看摘要並開始與聊天助教互動。")
 
-with tab_chat:
+st.divider()
+
+with st.container():
     if "summary" not in st.session_state:
-        st.info("請先在「📂 輸入教材」標籤上傳教材並執行分析。")
+        st.info("請先上傳教材或貼入文字並執行分析，聊天助教會在摘要完成後出現。")
     elif not api_key:
         st.warning("請先在左側欄輸入 Gemini API Key。")
     else:
         st.subheader("💬 課程聊天助教")
         st.caption("你可以問課程問題；若訊息需要出題，AI 會自動啟動 QuizAgent。")
+        chunk_count = len(st.session_state.get("material_chunks", []))
+        if chunk_count:
+            st.caption(f"簡化 RAG 已啟用：目前建立 {chunk_count} 個教材片段，聊天與出題會先檢索相關內容。")
+        else:
+            st.caption("目前沒有可檢索教材片段；PDF 會先以 Gemini Files 讀取與摘要作為上下文。")
 
         if "chat_messages" not in st.session_state:
             st.session_state["chat_messages"] = [
@@ -797,14 +947,19 @@ with tab_chat:
                     client = genai.Client(api_key=api_key)
                     core = AgentCore(client, difficulty=difficulty, model=model)
                     try:
-                        quiz_message = run_quiz_generation(
-                            core,
-                            st.session_state["summary"],
-                            selected_quiz_request,
-                        )
+                        with st.spinner("Thinking... 正在根據你的設定生成題目"):
+                            quiz_message = run_quiz_generation(
+                                core,
+                                st.session_state["summary"],
+                                selected_quiz_request,
+                                source_context=get_rag_context(
+                                    st.session_state.get("pending_quiz_query", "生成題目")
+                                ),
+                            )
                         render_chat_message(quiz_message, len(st.session_state["chat_messages"]))
                         st.session_state["chat_messages"].append(quiz_message)
                         st.session_state.pop("pending_quiz_request", None)
+                        st.session_state.pop("pending_quiz_query", None)
                         st.rerun()
                     except Exception as e:
                         reply = f"題目生成失敗：{e}"
@@ -826,9 +981,11 @@ with tab_chat:
 
             with st.chat_message("assistant"):
                 try:
-                    decision = core.decide_chat_action(summary, chat_prompt)
+                    with st.spinner("Thinking... 正在判斷你的需求"):
+                        decision = core.decide_chat_action(summary, chat_prompt)
                     if decision["action"] == "GENERATE_QUIZ":
-                        quiz_request = parse_quiz_request(chat_prompt, 5)
+                        with st.spinner("Thinking... 正在分析題型與題數"):
+                            quiz_request = core.extract_quiz_request(chat_prompt)
                         if quiz_request["needs_clarification"]:
                             reply = (
                                 "我判斷這次需求需要生成題目，但還需要補充題型與題數。"
@@ -836,24 +993,33 @@ with tab_chat:
                             )
                             st.markdown(reply)
                             st.session_state["pending_quiz_request"] = quiz_request
+                            st.session_state["pending_quiz_query"] = chat_prompt
                             st.session_state["chat_messages"].append(
                                 {"role": "assistant", "content": reply}
                             )
                             st.rerun()
                         else:
                             st.markdown("我判斷這次需求需要產生題目，正在啟動 QuizAgent。")
-                            quiz_message = run_quiz_generation(core, summary, quiz_request)
+                            with st.spinner("Thinking... 正在生成並審查題目"):
+                                quiz_message = run_quiz_generation(
+                                    core,
+                                    summary,
+                                    quiz_request,
+                                    source_context=get_rag_context(chat_prompt),
+                                )
                             render_chat_message(
                                 quiz_message,
                                 len(st.session_state["chat_messages"]),
                             )
                             st.session_state["chat_messages"].append(quiz_message)
                     else:
-                        reply = core.answer_chat(
-                            summary,
-                            st.session_state["chat_messages"],
-                            chat_prompt,
-                        )
+                        with st.spinner("Thinking... 正在查找教材並回答"):
+                            reply = core.answer_chat(
+                                summary,
+                                st.session_state["chat_messages"],
+                                chat_prompt,
+                                source_context=get_rag_context(chat_prompt),
+                            )
                         st.markdown(reply)
                         st.session_state["chat_messages"].append(
                             {"role": "assistant", "content": reply}
