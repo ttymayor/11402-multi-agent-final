@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "google-genai>=2.8.0",
+    "pypdf>=6.13.3",
     "streamlit>=1.58.0",
 ]
